@@ -97,6 +97,9 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
       </section>
       <section class="page" id="p-out">
         <h3>大きさ</h3><div class="seg" id="res"></div>
+        <h3>音（MP3・M4A など）</h3>
+        <div class="row"><label class="chip" style="display:inline-flex;align-items:center">音のファイルを選ぶ<input type="file" id="afile" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac" hidden></label><button class="chip" id="aclear" style="display:none">外す</button></div>
+        <p class="note" id="ainfo">入れると、その音付きで書き出します。長さは曲に合わせます。曲より長くすると頭から繰り返し、どちらの場合も最後の1.5秒で音を小さくして終えます。この画面に音のファイルを放り込んでも入ります。</p>
         <h3>長さ</h3>
         <div class="seg" data-key="minutes"></div>
         <div class="row" style="margin-top:6px"><input type="text" id="mins" inputmode="decimal" autocomplete="off" style="width:110px;background:#1b1b20;border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-height:38px"><span class="note" style="margin:0">3:19 のように 分:秒 で入れられます</span></div>
@@ -116,7 +119,7 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
 <script src="mp4-muxer.js"></script>
 <script>
 'use strict';
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 // ---------- 乱数・小道具 ----------
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
@@ -636,7 +639,28 @@ const save=()=>{try{localStorage.setItem('endless-dungeon',JSON.stringify(cfg));
 const $=s=>document.querySelector(s), out=$('#out'), octx=out.getContext('2d');
 let sim, playing=true, exporting=false, cancelled=false;
 const newSim=()=>new Sim({seed:cfg.seed,speed:cfg.speed,walk:cfg.walk,cfg});
-function restart(){sim=newSim();}
+function restart(){sim=newSim();if(snd){snd.el.currentTime=0;if(playing)snd.el.play().catch(()=>{});}}
+
+// ---------- 音 ----------
+let snd=null;
+const AINFO='入れると、その音付きで書き出します。長さは曲に合わせます。曲より長くすると頭から繰り返し、どちらの場合も最後の1.5秒で音を小さくして終えます。この画面に音のファイルを放り込んでも入ります。';
+async function loadAudio(file){
+  $('#ainfo').textContent='読み込んでいます…';
+  let buf;
+  try{
+    const ac=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+    buf=await ac.decodeAudioData(await file.arrayBuffer());ac.close();
+  }catch(e){console.error(e);$('#ainfo').textContent='この音のファイルは読めませんでした。';return;}
+  clearAudio(true);
+  const url=URL.createObjectURL(file),el=new Audio(url);el.loop=true;
+  snd={buf,name:file.name,url,el};
+  cfg.minutes=Math.max(1,Math.floor(buf.duration))/60;save();renderUI();restart();showAudio();
+}
+function clearAudio(quiet){if(snd){snd.el.pause();URL.revokeObjectURL(snd.url);}snd=null;if(!quiet)showAudio();}
+function showAudio(){
+  $('#aclear').style.display=snd?'':'none';
+  $('#ainfo').textContent=snd?`「${snd.name}」（${fmt(snd.buf.duration)}）を付けて書き出します。曲より長くすると頭から繰り返し、最後の1.5秒で音を小さくして終えます。`:AINFO;
+}
 function sizeCanvas(){const[w,h]=cfg.res.split('x').map(Number);if(out.width!==w||out.height!==h){out.width=w;out.height=h;}}
 
 function renderUI(){
@@ -682,6 +706,7 @@ function loop(ts){
   const dt=Math.min(.25,(ts-last)/1000);last=ts;
   if(!exporting){
     if(playing)sim.update(dt);
+    if(snd&&playing&&!snd.el.paused&&Math.abs(snd.el.currentTime-sim.time%snd.buf.duration)>.3)snd.el.currentTime=sim.time%snd.buf.duration;
     drawFrame(octx,out.width,out.height,sim,lookFor(sim));
     $('#clock').textContent=`${fmt(sim.time)}　地下${sim.floor}階`;
   }
@@ -701,6 +726,14 @@ async function exportMp4(){
     try{if((await VideoEncoder.isConfigSupported(c)).supported){config=c;break;}}catch(e){}
   }
   if(!config){alert('この大きさの動画を作れませんでした。小さめの大きさで試してください。');return;}
+  let aconf=null;const asr=snd?snd.buf.sampleRate:0,ach=snd?Math.min(2,snd.buf.numberOfChannels):0;
+  if(snd){
+    if('AudioEncoder' in window)for(const codec of['mp4a.40.2','opus']){
+      const c={codec,sampleRate:asr,numberOfChannels:ach,bitrate:192000};
+      try{if((await AudioEncoder.isConfigSupported(c)).supported){aconf=c;break;}}catch(e){}
+    }
+    if(!aconf){alert('このブラウザでは音付きの動画を作れません。Chrome か Edge で開いてください。');return;}
+  }
   const name=`endless-dungeon_${cfg.seed}_${W}x${H}.mp4`;
   let stream=null,target=null;
   if(window.showSaveFilePicker){
@@ -709,10 +742,25 @@ async function exportMp4(){
     catch(e){if(e.name==='AbortError')return;}
   }
   if(!target)target=new Mp4Muxer.ArrayBufferTarget();
-  const muxer=new Mp4Muxer.Muxer({target,video:{codec:'avc',width:W,height:H,frameRate:fps},fastStart:stream?false:'in-memory',firstTimestampBehavior:'offset'});
+  const muxer=new Mp4Muxer.Muxer({target,video:{codec:'avc',width:W,height:H,frameRate:fps},
+    audio:aconf?{codec:aconf.codec==='opus'?'opus':'aac',sampleRate:asr,numberOfChannels:ach}:undefined,fastStart:stream?false:'in-memory',firstTimestampBehavior:'offset'});
   let err=null;
   const enc=new VideoEncoder({output:(ch,meta)=>muxer.addVideoChunk(ch,meta),error:e=>{err=e;}});
   enc.configure(config);
+  let aenc=null,apos=0;const atotal=Math.round(total/fps*asr),FADE=1.5;
+  if(aconf){aenc=new AudioEncoder({output:(ch,meta)=>muxer.addAudioChunk(ch,meta),error:e=>{err=e;}});aenc.configure(aconf);}
+  // 動画のコマに追いつくまで音を流し込む（曲が短ければ頭から繰り返し、最後はしぼる）
+  const feed=until=>{
+    if(!aenc)return;
+    const L=snd.buf.length,src=[...Array(ach)].map((_,c)=>snd.buf.getChannelData(Math.min(c,snd.buf.numberOfChannels-1)));
+    while(apos<until){
+      const n=Math.min(4096,until-apos),data=new Float32Array(n*ach);
+      for(let c=0;c<ach;c++)for(let k=0;k<n;k++){const s=apos+k,rem=(atotal-s)/asr;data[c*n+k]=src[c][s%L]*(rem<FADE?rem/FADE:1);}
+      const ad=new AudioData({format:'f32-planar',sampleRate:asr,numberOfFrames:n,numberOfChannels:ach,timestamp:Math.round(apos/asr*1e6),data});
+      aenc.encode(ad);ad.close();apos+=n;
+    }
+  };
+  if(snd)snd.el.pause();
   exporting=true;cancelled=false;document.body.classList.add('lock');$('#go').disabled=true;$('#prog').classList.add('on');
   const xs=newSim(),dt=1/fps,t0=performance.now();
   const tick=()=>new Promise(r=>setTimeout(r,0));
@@ -723,7 +771,8 @@ async function exportMp4(){
       drawFrame(octx,W,H,xs,lookFor(xs));
       const vf=new VideoFrame(out,{timestamp:Math.round(i*1e6/fps),duration:Math.round(1e6/fps)});
       enc.encode(vf,{keyFrame:i%(fps*2)===0});vf.close();
-      while(enc.encodeQueueSize>6&&!err)await tick();
+      feed(Math.min(atotal,Math.round((i+1)/fps*asr)));
+      while((enc.encodeQueueSize>6||(aenc&&aenc.encodeQueueSize>16))&&!err)await tick();
       if(i%10===0){
         const el=(performance.now()-t0)/1000,rest=el/(i+1)*(total-i-1);
         $('#meter').style.width=(i/total*100).toFixed(1)+'%';
@@ -732,18 +781,19 @@ async function exportMp4(){
       }
     }
     if(err)throw err;
-    if(cancelled){enc.close();if(stream)await stream.abort().catch(()=>{});$('#progt').textContent='中止しました';return;}
+    if(cancelled){enc.close();if(aenc)aenc.close();if(stream)await stream.abort().catch(()=>{});$('#progt').textContent='中止しました';return;}
     $('#progt').textContent='仕上げています…';
-    await enc.flush();muxer.finalize();
+    feed(atotal);
+    await enc.flush();if(aenc)await aenc.flush();muxer.finalize();
     if(stream)await stream.close();
     else{const url=URL.createObjectURL(new Blob([target.buffer],{type:'video/mp4'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);}
     $('#meter').style.width='100%';
     $('#progt').textContent=`できました（${fmt(total/fps)}・${((performance.now()-t0)/1000).toFixed(0)}秒で書き出し）`;
   }catch(e){
     console.error(e);$('#progt').textContent='書き出しに失敗しました: '+(e.message||e);
-    try{enc.close();}catch(_){}if(stream)stream.abort().catch(()=>{});
+    try{enc.close();}catch(_){}try{if(aenc)aenc.close();}catch(_){}if(stream)stream.abort().catch(()=>{});
   }finally{
-    exporting=false;document.body.classList.remove('lock');$('#go').disabled=false;$('#cancel').style.display='none';
+    exporting=false;document.body.classList.remove('lock');if(snd&&playing){snd.el.currentTime=sim.time%snd.buf.duration;snd.el.play().catch(()=>{});}$('#go').disabled=false;$('#cancel').style.display='none';
   }
 }
 
@@ -751,7 +801,11 @@ async function exportMp4(){
 try{view3d=new View3D();}catch(e){document.body.innerHTML='<p style="padding:24px">このブラウザでは3D表示が使えません。</p>';throw e;}
 buildThemes();renderUI();setupTabs();sizeCanvas();restart();
 $('#ver').textContent='v'+VERSION;
-$('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';};
+$('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';if(snd){if(playing)snd.el.play().catch(()=>{});else snd.el.pause();}};
+$('#afile').onchange=e=>{const f=e.target.files[0];if(f)loadAudio(f);e.target.value='';};
+$('#aclear').onclick=()=>clearAudio();
+addEventListener('dragover',e=>e.preventDefault());
+addEventListener('drop',e=>{e.preventDefault();const f=[...e.dataTransfer.files].find(f=>/^audio\/|\.(mp3|m4a|aac|wav|ogg|flac)$/i.test(f.type+' '+f.name));if(f&&!exporting)loadAudio(f);});
 $('#restart').onclick=restart;
 $('#seed').onchange=e=>{const v=clamp(parseInt(e.target.value)||1,1,999999);cfg.seed=v;save();renderUI();restart();};
 $('#dice').onclick=()=>{cfg.seed=1+((Math.random()*999999)|0);save();renderUI();restart();};
