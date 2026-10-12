@@ -100,6 +100,11 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
         <h3>音（MP3・M4A など）</h3>
         <div class="row"><label class="chip" style="display:inline-flex;align-items:center">音のファイルを選ぶ<input type="file" id="afile" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac" hidden></label><button class="chip" id="aclear" style="display:none">外す</button></div>
         <p class="note" id="ainfo">入れると、その音付きで書き出します。長さは曲に合わせます。曲より長くすると頭から繰り返し、どちらの場合も最後の1.5秒で音を小さくして終えます。この画面に音のファイルを放り込んでも入ります。</p>
+        <div id="lyrbox" style="display:none">
+          <h3>歌詞</h3><div class="seg" data-key="lyrics"></div>
+          <div class="row" style="margin-top:6px"><label class="chip" style="display:inline-flex;align-items:center">歌詞のファイルを選ぶ<input type="file" id="lfile" accept=".lrc,.srt,.vtt,text/plain" hidden></label></div>
+          <p class="note" id="linfo"></p>
+        </div>
         <h3>長さ</h3>
         <div class="seg" data-key="minutes"></div>
         <div class="row" style="margin-top:6px"><input type="text" id="mins" inputmode="decimal" autocomplete="off" style="width:110px;background:#1b1b20;border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-height:38px"><span class="note" style="margin:0">3:19 のように 分:秒 で入れられます</span></div>
@@ -119,7 +124,7 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
 <script src="mp4-muxer.js"></script>
 <script>
 'use strict';
-const VERSION = '1.2.2';
+const VERSION = '1.3.0';
 
 // ---------- 乱数・小道具 ----------
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
@@ -550,6 +555,24 @@ function box(g,r,col,s){
   const o=lw/2;g.strokeRect(r.x+o,r.y+o,r.w-lw,r.h-lw);
   const i=Math.round(s*3.5)+lw*1.5;g.strokeRect(r.x+i,r.y+i,r.w-i*2,r.h-i*2);
 }
+function wrapText(g,t,w){
+  const out=[];let line='';
+  for(const ch of t){
+    if(line&&g.measureText(line+ch).width>w){
+      const sp=Math.max(line.lastIndexOf(' '),line.lastIndexOf('　'));
+      if(sp>line.length*.5){out.push(line.slice(0,sp));line=line.slice(sp+1)+ch;}
+      else{out.push(line);line=ch.trim()?ch:'';}
+    }else line+=ch;
+  }
+  if(line)out.push(line);return out;
+}
+// いまの歌詞（曲が繰り返すなら歌詞も頭から）
+function lyricState(sim){
+  if(!cfg.lyrics||!snd||!snd.lyrics||!snd.lyrics.length)return null;
+  const t=sim.time%snd.buf.duration,L=snd.lyrics;let k=-1;
+  for(let i=0;i<L.length&&L[i].t0<=t;i++)k=i;
+  return{t,k,L,active:k>=0&&t<L[k].t1?L[k]:null};
+}
 function fitText(g,t,w){if(g.measureText(t).width<=w)return t;while(t.length&&g.measureText(t+'…').width>w)t=t.slice(0,-1);return t+'…';}
 function lookFor(sim){
   let theme=THEMES.find(t=>t.id===cfg.theme)||THEMES[0];
@@ -573,7 +596,20 @@ function drawFrame(g,W,H,sim,look){
     const fs=Math.round(v.h*.085);g.font=`${fs}px ${FONT}`;g.textAlign='center';g.textBaseline='middle';
     g.fillStyle=rgb(look.ui,ba);g.fillText(sim.banner.text,v.x+v.w/2,v.y+v.h/2);g.textAlign='left';
   }
-  if(!cfg.deco)return;
+  const ls=lyricState(sim);
+  if(!cfg.deco){
+    // 飾りなしのときは画面の下に字幕で
+    if(ls&&ls.active){
+      const e=ls.active,a=clamp(Math.min((ls.t-e.t0)/.2,(e.t1-ls.t)/.2),0,1),f2=Math.round(v.h*.052);
+      g.font=`${f2}px ${FONT}`;g.textAlign='center';g.textBaseline='alphabetic';g.lineJoin='round';
+      const lines=wrapText(g,e.text,v.w*.86);
+      lines.forEach((l,i)=>{const y=v.y+v.h-f2*.9-(lines.length-1-i)*f2*1.3;
+        g.lineWidth=f2*.24;g.strokeStyle=`rgba(0,0,0,${.85*a})`;g.strokeText(l,v.x+v.w/2,y);
+        g.fillStyle=rgb(look.ui,a);g.fillText(l,v.x+v.w/2,y);});
+      g.textAlign='left';
+    }
+    return;
+  }
   box(g,{x:v.x-Math.round(s*6),y:v.y-Math.round(s*6),w:v.w+Math.round(s*12),h:v.h+Math.round(s*12)},col,s);
   for(const r of[L.map,L.party,L.msg])box(g,r,col,s);
   const pad=Math.round(s*12),rowH=(L.party.h-pad*2)/7,fs=Math.max(8,Math.floor(Math.min(rowH*.78,s*15)));
@@ -610,9 +646,19 @@ function drawFrame(g,W,H,sim,look){
     g.restore();}
   // メッセージ
   {const r=L.msg,lh=fs*1.45,n=Math.max(1,Math.floor((r.h-pad*2-fs*1.5)/lh)),w=r.w-pad*2;
-    const lines=sim.log.slice(-n);
-    lines.forEach((m,i)=>{const fresh=clamp((sim.time-m.t)/.25,0,1);
-      g.fillStyle=rgb(look.ui,(i===lines.length-1?1:.55)*fresh);g.fillText(fitText(g,m.text,w),r.x+pad,r.y+pad+lh*i);});
+    if(ls&&ls.k>=0){
+      // 歌詞：歌っている行は明るく、過ぎた行は暗く。長い行は折り返す
+      let rows=[];
+      for(let i=ls.k;i>=0&&rows.length<n;i--){
+        const e=ls.L[i],a=(e===ls.active?1:.42)*(i===ls.k?clamp((ls.t-e.t0)/.25,0,1):1);
+        rows=wrapText(g,e.text,w).map(text=>({text,a})).concat(rows);
+      }
+      rows.slice(-n).forEach((m,i)=>{g.fillStyle=rgb(look.ui,m.a);g.fillText(m.text,r.x+pad,r.y+pad+lh*i);});
+    }else{
+      const lines=sim.log.slice(-n);
+      lines.forEach((m,i)=>{const fresh=clamp((sim.time-m.t)/.25,0,1);
+        g.fillStyle=rgb(look.ui,(i===lines.length-1?1:.55)*fresh);g.fillText(fitText(g,m.text,w),r.x+pad,r.y+pad+lh*i);});
+    }
     g.fillStyle=rgb(look.ui,.6);g.textAlign='right';g.fillText(`${sim.gold} G`,r.x+r.w-pad,r.y+r.h-pad-fs);g.textAlign='left';}
 }
 
@@ -628,9 +674,10 @@ const OPTS={
   speed:[['slow','ゆっくり'],['mid','ふつう'],['fast','はやい']],
   minutes:[[1,'1分'],[3,'3分'],[5,'5分'],[10,'10分']],
   fps:[[30,'30コマ/秒'],[60,'60コマ/秒']],
+  lyrics:[[true,'出す'],[false,'出さない']],
 };
 const RESTART=new Set(['walk','speed']);
-const DEF={aspect:'4:3',res:'1440x1080',theme:'wire',line:'white',deco:true,pixel:'full',view:'mid',walk:'smooth',speed:'mid',seed:1+((Math.random()*999999)|0),minutes:5,fps:30};
+const DEF={aspect:'4:3',res:'1440x1080',theme:'wire',line:'white',deco:true,pixel:'full',view:'mid',walk:'smooth',speed:'mid',seed:1+((Math.random()*999999)|0),minutes:5,fps:30,lyrics:true};
 let cfg={...DEF};
 try{Object.assign(cfg,JSON.parse(localStorage.getItem('endless-dungeon')||'{}'));}catch(e){}
 if(!RES[cfg.aspect].some(r=>r[0]===cfg.res))cfg.res=RES[cfg.aspect].at(-1)[0];
@@ -657,7 +704,7 @@ const player={ctx:null,src:null,t0:0,
   pos(buf){return(this.ctx.currentTime-this.t0)%buf.duration;},
 };
 // MP4（.m4a）の中から Opus の音の粒を取り出す
-function mp4Opus(ab){
+function mp4Reader(ab){
   const dv=new DataView(ab),u8=new Uint8Array(ab),str=o=>String.fromCharCode(u8[o],u8[o+1],u8[o+2],u8[o+3]);
   const boxes=(s,e)=>{const r=[];for(let o=s;o+8<=e;){let n=dv.getUint32(o),h=8;
     if(n===1){n=Number(dv.getBigUint64(o+8));h=16;}else if(n===0)n=e-o;
@@ -665,6 +712,26 @@ function mp4Opus(ab){
   const kid=(b,t)=>b&&boxes(b.s,b.e).find(x=>x.t===t);
   const moov=boxes(0,ab.byteLength).find(x=>x.t==='moov');
   if(!moov)throw new Error('MP4 ではない');
+  // 標本ごとの位置と大きさ
+  const samples=stbl=>{
+    const stsz=kid(stbl,'stsz'),stsc=kid(stbl,'stsc'),stco=kid(stbl,'stco'),co64=kid(stbl,'co64');
+    const fixed=dv.getUint32(stsz.s+4),count=dv.getUint32(stsz.s+8),size=i=>fixed||dv.getUint32(stsz.s+12+i*4);
+    const offs=[];
+    if(stco)for(let i=0,n=dv.getUint32(stco.s+4);i<n;i++)offs.push(dv.getUint32(stco.s+8+i*4));
+    else for(let i=0,n=dv.getUint32(co64.s+4);i<n;i++)offs.push(Number(dv.getBigUint64(co64.s+8+i*8)));
+    const runs=[];for(let i=0,n=dv.getUint32(stsc.s+4);i<n;i++)runs.push([dv.getUint32(stsc.s+8+i*12),dv.getUint32(stsc.s+12+i*12)]);
+    const out=[];let si=0,ri=0;
+    for(let c=0;c<offs.length&&si<count;c++){
+      while(ri+1<runs.length&&runs[ri+1][0]<=c+1)ri++;
+      let o=offs[c];
+      for(let k=0;k<runs[ri][1]&&si<count;k++,si++){const n=size(si);out.push({off:o,size:n});o+=n;}
+    }
+    return out;
+  };
+  return{dv,u8,str,boxes,kid,moov,samples};
+}
+function mp4Opus(ab){
+  const{dv,u8,str,boxes,kid,moov,samples}=mp4Reader(ab);
   for(const trak of boxes(moov.s,moov.e).filter(x=>x.t==='trak')){
     const mdia=kid(trak,'mdia'),hdlr=kid(mdia,'hdlr');
     if(!hdlr||str(hdlr.s+8)!=='soun')continue;
@@ -677,21 +744,65 @@ function mp4Opus(ab){
     const skip=elst&&dv.getUint32(elst.s+4)>0?(u8[elst.s]===1?Number(dv.getBigInt64(elst.s+16)):dv.getInt32(elst.s+12)):dv.getUint16(d+2);
     if(fam>0){opt.streamCount=u8[d+11];opt.coupledStreamCount=u8[d+12];opt.channelMappingTable=[...u8.subarray(d+13,d+13+ch)];}
     if(ch>2)opt.forceStereo=true;
-    const stsz=kid(stbl,'stsz'),stsc=kid(stbl,'stsc'),stco=kid(stbl,'stco'),co64=kid(stbl,'co64');
-    const fixed=dv.getUint32(stsz.s+4),count=dv.getUint32(stsz.s+8),size=i=>fixed||dv.getUint32(stsz.s+12+i*4);
-    const offs=[];
-    if(stco)for(let i=0,n=dv.getUint32(stco.s+4);i<n;i++)offs.push(dv.getUint32(stco.s+8+i*4));
-    else for(let i=0,n=dv.getUint32(co64.s+4);i<n;i++)offs.push(Number(dv.getBigUint64(co64.s+8+i*8)));
-    const runs=[];for(let i=0,n=dv.getUint32(stsc.s+4);i<n;i++)runs.push([dv.getUint32(stsc.s+8+i*12),dv.getUint32(stsc.s+12+i*12)]);
-    const packets=[];let si=0,ri=0;
-    for(let c=0;c<offs.length&&si<count;c++){
-      while(ri+1<runs.length&&runs[ri+1][0]<=c+1)ri++;
-      let o=offs[c];
-      for(let k=0;k<runs[ri][1]&&si<count;k++,si++){const n=size(si);packets.push(u8.subarray(o,o+n));o+=n;}
-    }
+    const packets=samples(stbl).map(x=>u8.subarray(x.off,x.off+x.size));
     return{opt,packets,skip:Math.max(0,skip)};
   }
   throw new Error('音のトラックがない');
+}
+// MP4 に入っている字幕（歌詞）のトラックを読む
+function mp4Lyrics(ab){
+  const{dv,u8,str,boxes,kid,moov,samples}=mp4Reader(ab);
+  const tsOf=b=>dv.getUint32(b.s+(u8[b.s]===1?20:12));
+  const mts=tsOf(kid(moov,'mvhd')),dec=new TextDecoder();
+  for(const trak of boxes(moov.s,moov.e).filter(x=>x.t==='trak')){
+    const mdia=kid(trak,'mdia'),hdlr=kid(mdia,'hdlr');
+    if(!hdlr||!['sbtl','text','subt'].includes(str(hdlr.s+8)))continue;
+    const ts=tsOf(kid(mdia,'mdhd')),stbl=kid(kid(mdia,'minf'),'stbl'),stts=kid(stbl,'stts');
+    // 編集リスト：頭の空白（-1）と、使い始める位置
+    let delay=0,mstart=0;const elst=kid(kid(trak,'edts'),'elst');
+    if(elst){const v1=u8[elst.s]===1,sz=v1?20:12;
+      for(let i=0,n=dv.getUint32(elst.s+4);i<n;i++){const o=elst.s+8+i*sz,dur=v1?Number(dv.getBigUint64(o)):dv.getUint32(o),mt=v1?Number(dv.getBigInt64(o+8)):dv.getInt32(o+4);
+        if(mt===-1)delay+=dur/mts;else{mstart=mt;break;}}}
+    const sm=samples(stbl),out=[];let t=0,k=0;
+    for(let i=0,n=dv.getUint32(stts.s+4);i<n;i++){
+      const c=dv.getUint32(stts.s+8+i*8),d=dv.getUint32(stts.s+12+i*8);
+      for(let j=0;j<c&&k<sm.length;j++,k++){
+        const{off,size}=sm[k];
+        if(size>=2){const L=dv.getUint16(off),text=dec.decode(u8.subarray(off+2,off+2+Math.min(L,size-2)));
+          out.push({t0:delay+(t-mstart)/ts,t1:delay+(t+d-mstart)/ts,text});}
+        t+=d;
+      }
+    }
+    return cleanLyrics(out);
+  }
+  return[];
+}
+// .srt / .vtt / .lrc の歌詞ファイル
+function parseLyricsText(txt){
+  const out=[];txt=txt.replace(/\r/g,'');
+  if(/-->/.test(txt)){
+    const T=(h,m,s,ms)=>(+h||0)*3600+ +m*60+ +s+ +ms/1000;
+    for(const blk of txt.split(/\n\s*\n/)){
+      const lines=blk.split('\n'),i=lines.findIndex(l=>l.includes('-->'));if(i<0)continue;
+      const m=lines[i].match(/(?:(\d+):)?(\d+):(\d+)[,.](\d+)\s*-->\s*(?:(\d+):)?(\d+):(\d+)[,.](\d+)/);if(!m)continue;
+      out.push({t0:T(m[1],m[2],m[3],m[4]),t1:T(m[5],m[6],m[7],m[8]),text:lines.slice(i+1).join(' ').replace(/<[^>]+>/g,'')});
+    }
+  }else{
+    for(const line of txt.split('\n')){
+      const tags=[...line.matchAll(/\[(\d+):(\d+(?:\.\d+)?)\]/g)];if(!tags.length)continue;
+      const text=line.replace(/\[[^\]]*\]/g,'').replace(/<[^>]+>/g,'');
+      for(const m of tags)out.push({t0:+m[1]*60+ +m[2],text});
+    }
+    out.sort((a,b)=>a.t0-b.t0);out.forEach((e,i)=>e.t1=out[i+1]?out[i+1].t0:e.t0+6);
+  }
+  return cleanLyrics(out);
+}
+// 空行と [Verse 1] のような区切りの印を除く
+const cleanLyrics=a=>a.map(e=>({...e,text:e.text.trim()})).filter(e=>e.text&&!/^\[.*\]$/.test(e.text)).sort((a,b)=>a.t0-b.t0);
+async function loadLyrics(file){
+  if(!snd){$('#ainfo').textContent='先に音のファイルを入れてください。';return;}
+  try{snd.lyrics=parseLyricsText(await file.text());snd.lyricsFrom=file.name;}catch(e){console.error(e);snd.lyrics=[];}
+  showAudio();
 }
 const loadScript=src=>new Promise((ok,ng)=>{const s=document.createElement('script');s.src=src;s.onload=ok;s.onerror=ng;document.head.appendChild(s);});
 async function decodeOpusMp4(ab){
@@ -718,13 +829,17 @@ async function loadAudio(file){
       buf=await decodeOpusMp4(ab);
     }
   }catch(e){console.error(e);$('#ainfo').textContent='この音のファイルは読めませんでした。';return;}
+  let lyrics=[];
+  try{lyrics=mp4Lyrics(await file.arrayBuffer());}catch(e){}
   clearAudio(true);
-  snd={buf,name:file.name};
+  snd={buf,name:file.name,lyrics};
   cfg.minutes=Math.max(1,Math.floor(buf.duration))/60;save();renderUI();restart();showAudio();
 }
 function clearAudio(quiet){player.stop();snd=null;if(!quiet)showAudio();}
 function showAudio(){
   $('#aclear').style.display=snd?'':'none';
+  $('#lyrbox').style.display=snd?'':'none';
+  if(snd)$('#linfo').textContent=snd.lyrics.length?`${snd.lyricsFrom?'「'+snd.lyricsFrom+'」の':'曲に入っていた'}歌詞（${snd.lyrics.length}行）を、画面の飾りがあるときはメッセージ欄に、ないときは画面の下に流します。`:'この曲には歌詞が入っていません。.lrc や .srt の歌詞ファイルを入れることもできます。';
   $('#ainfo').textContent=snd?`「${snd.name}」（${fmt(snd.buf.duration)}）を付けて書き出します。曲より長くすると頭から繰り返し、最後の1.5秒で音を小さくして終えます。`:AINFO;
 }
 function sizeCanvas(){const[w,h]=cfg.res.split('x').map(Number);if(out.width!==w||out.height!==h){out.width=w;out.height=h;}}
@@ -897,8 +1012,11 @@ $('#ver').textContent='v'+VERSION;
 $('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';if(snd){if(playing)player.play(snd.buf,sim.time);else player.stop();}};
 $('#afile').onchange=e=>{const f=e.target.files[0];if(f)loadAudio(f);e.target.value='';};
 $('#aclear').onclick=()=>clearAudio();
+$('#lfile').onchange=e=>{const f=e.target.files[0];if(f)loadLyrics(f);e.target.value='';};
 addEventListener('dragover',e=>e.preventDefault());
-addEventListener('drop',e=>{e.preventDefault();const f=[...e.dataTransfer.files].find(f=>/^audio\/|\.(mp3|m4a|aac|wav|ogg|flac)$/i.test(f.type+' '+f.name));if(f&&!exporting)loadAudio(f);});
+addEventListener('drop',e=>{e.preventDefault();
+  const lf=[...e.dataTransfer.files].find(f=>/\.(lrc|srt|vtt)$/i.test(f.name));if(lf&&!exporting){loadLyrics(lf);return;}
+  const f=[...e.dataTransfer.files].find(f=>/^audio\/|\.(mp3|m4a|aac|wav|ogg|flac)$/i.test(f.type+' '+f.name));if(f&&!exporting)loadAudio(f);});
 $('#restart').onclick=restart;
 $('#seed').onchange=e=>{const v=clamp(parseInt(e.target.value)||1,1,999999);cfg.seed=v;save();renderUI();restart();};
 $('#dice').onclick=()=>{cfg.seed=1+((Math.random()*999999)|0);save();renderUI();restart();};
