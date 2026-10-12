@@ -119,7 +119,7 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
 <script src="mp4-muxer.js"></script>
 <script>
 'use strict';
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 
 // ---------- 乱数・小道具 ----------
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
@@ -639,24 +639,90 @@ const save=()=>{try{localStorage.setItem('endless-dungeon',JSON.stringify(cfg));
 const $=s=>document.querySelector(s), out=$('#out'), octx=out.getContext('2d');
 let sim, playing=true, exporting=false, cancelled=false;
 const newSim=()=>new Sim({seed:cfg.seed,speed:cfg.speed,walk:cfg.walk,cfg});
-function restart(){sim=newSim();if(snd){snd.el.currentTime=0;if(playing)snd.el.play().catch(()=>{});}}
+function restart(){sim=newSim();if(snd&&playing)player.play(snd.buf,0);}
 
 // ---------- 音 ----------
 let snd=null;
 const AINFO='入れると、その音付きで書き出します。長さは曲に合わせます。曲より長くすると頭から繰り返し、どちらの場合も最後の1.5秒で音を小さくして終えます。この画面に音のファイルを放り込んでも入ります。';
+// プレビュー用の再生（ブラウザが鳴らせない形式でも、解いた後の波形を直接鳴らす）
+const player={ctx:null,src:null,t0:0,
+  unlock(){try{if(!this.ctx)this.ctx=new (window.AudioContext||window.webkitAudioContext)();this.ctx.resume();}catch(e){}},
+  play(buf,at){
+    this.stop();this.unlock();if(!this.ctx)return;
+    const s=this.ctx.createBufferSource(),off=at%buf.duration;
+    s.buffer=buf;s.loop=true;s.connect(this.ctx.destination);s.start(0,off);
+    this.src=s;this.t0=this.ctx.currentTime-off;
+  },
+  stop(){if(this.src){try{this.src.stop();}catch(e){}this.src.disconnect();this.src=null;}},
+  pos(buf){return(this.ctx.currentTime-this.t0)%buf.duration;},
+};
+// MP4（.m4a）の中から Opus の音の粒を取り出す
+function mp4Opus(ab){
+  const dv=new DataView(ab),u8=new Uint8Array(ab),str=o=>String.fromCharCode(u8[o],u8[o+1],u8[o+2],u8[o+3]);
+  const boxes=(s,e)=>{const r=[];for(let o=s;o+8<=e;){let n=dv.getUint32(o),h=8;
+    if(n===1){n=Number(dv.getBigUint64(o+8));h=16;}else if(n===0)n=e-o;
+    if(n<h)break;r.push({t:str(o+4),o,s:o+h,e:o+n});o+=n;}return r;};
+  const kid=(b,t)=>b&&boxes(b.s,b.e).find(x=>x.t===t);
+  const moov=boxes(0,ab.byteLength).find(x=>x.t==='moov');
+  if(!moov)throw new Error('MP4 ではない');
+  for(const trak of boxes(moov.s,moov.e).filter(x=>x.t==='trak')){
+    const mdia=kid(trak,'mdia'),hdlr=kid(mdia,'hdlr');
+    if(!hdlr||str(hdlr.s+8)!=='soun')continue;
+    const stbl=kid(kid(mdia,'minf'),'stbl'),stsd=kid(stbl,'stsd');
+    const en=stsd.s+8;if(str(en+4)!=='Opus')throw new Error('Opus ではない: '+str(en+4));
+    const dops=boxes(en+36,en+dv.getUint32(en)).find(x=>x.t==='dOps');
+    const d=dops.s,ch=u8[d+1],fam=u8[d+10],opt={channels:ch,preSkip:0};
+    // 頭の捨てる分は編集リストの開始位置（無ければヘッダの preSkip）
+    const elst=kid(kid(trak,'edts'),'elst');
+    const skip=elst&&dv.getUint32(elst.s+4)>0?(u8[elst.s]===1?Number(dv.getBigInt64(elst.s+16)):dv.getInt32(elst.s+12)):dv.getUint16(d+2);
+    if(fam>0){opt.streamCount=u8[d+11];opt.coupledStreamCount=u8[d+12];opt.channelMappingTable=[...u8.subarray(d+13,d+13+ch)];}
+    if(ch>2)opt.forceStereo=true;
+    const stsz=kid(stbl,'stsz'),stsc=kid(stbl,'stsc'),stco=kid(stbl,'stco'),co64=kid(stbl,'co64');
+    const fixed=dv.getUint32(stsz.s+4),count=dv.getUint32(stsz.s+8),size=i=>fixed||dv.getUint32(stsz.s+12+i*4);
+    const offs=[];
+    if(stco)for(let i=0,n=dv.getUint32(stco.s+4);i<n;i++)offs.push(dv.getUint32(stco.s+8+i*4));
+    else for(let i=0,n=dv.getUint32(co64.s+4);i<n;i++)offs.push(Number(dv.getBigUint64(co64.s+8+i*8)));
+    const runs=[];for(let i=0,n=dv.getUint32(stsc.s+4);i<n;i++)runs.push([dv.getUint32(stsc.s+8+i*12),dv.getUint32(stsc.s+12+i*12)]);
+    const packets=[];let si=0,ri=0;
+    for(let c=0;c<offs.length&&si<count;c++){
+      while(ri+1<runs.length&&runs[ri+1][0]<=c+1)ri++;
+      let o=offs[c];
+      for(let k=0;k<runs[ri][1]&&si<count;k++,si++){const n=size(si);packets.push(u8.subarray(o,o+n));o+=n;}
+    }
+    return{opt,packets,skip:Math.max(0,skip)};
+  }
+  throw new Error('音のトラックがない');
+}
+const loadScript=src=>new Promise((ok,ng)=>{const s=document.createElement('script');s.src=src;s.onload=ok;s.onerror=ng;document.head.appendChild(s);});
+async function decodeOpusMp4(ab){
+  const{opt,packets,skip}=mp4Opus(ab);
+  if(!window['opus-decoder'])await loadScript('opus-decoder.min.js');
+  const dec=new window['opus-decoder'].OpusDecoder(opt);await dec.ready;
+  const r=dec.decodeFrames(packets);dec.free();
+  const n=r.samplesDecoded-skip,buf=new AudioBuffer({length:n,numberOfChannels:r.channelData.length,sampleRate:r.sampleRate});
+  r.channelData.forEach((c,i)=>buf.copyToChannel(c.subarray(skip,skip+n),i));
+  return buf;
+}
 async function loadAudio(file){
+  player.unlock();
   $('#ainfo').textContent='読み込んでいます…';
   let buf;
   try{
-    const ac=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
-    buf=await ac.decodeAudioData(await file.arrayBuffer());ac.close();
+    const ab=await file.arrayBuffer();
+    try{
+      const ac=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+      buf=await ac.decodeAudioData(ab.slice(0));ac.close();
+    }catch(e){
+      // ブラウザ自身が読めないとき（Safari で Opus 入りの .m4a など）は自前で解く
+      console.warn('decodeAudioData に失敗、自前で解く',e);
+      buf=await decodeOpusMp4(ab);
+    }
   }catch(e){console.error(e);$('#ainfo').textContent='この音のファイルは読めませんでした。';return;}
   clearAudio(true);
-  const url=URL.createObjectURL(file),el=new Audio(url);el.loop=true;
-  snd={buf,name:file.name,url,el};
+  snd={buf,name:file.name};
   cfg.minutes=Math.max(1,Math.floor(buf.duration))/60;save();renderUI();restart();showAudio();
 }
-function clearAudio(quiet){if(snd){snd.el.pause();URL.revokeObjectURL(snd.url);}snd=null;if(!quiet)showAudio();}
+function clearAudio(quiet){player.stop();snd=null;if(!quiet)showAudio();}
 function showAudio(){
   $('#aclear').style.display=snd?'':'none';
   $('#ainfo').textContent=snd?`「${snd.name}」（${fmt(snd.buf.duration)}）を付けて書き出します。曲より長くすると頭から繰り返し、最後の1.5秒で音を小さくして終えます。`:AINFO;
@@ -706,7 +772,7 @@ function loop(ts){
   const dt=Math.min(.25,(ts-last)/1000);last=ts;
   if(!exporting){
     if(playing)sim.update(dt);
-    if(snd&&playing&&!snd.el.paused&&Math.abs(snd.el.currentTime-sim.time%snd.buf.duration)>.3)snd.el.currentTime=sim.time%snd.buf.duration;
+    if(snd&&playing&&player.src){const D=snd.buf.duration,g=Math.abs(player.pos(snd.buf)-sim.time%D);if(Math.min(g,D-g)>.3)player.play(snd.buf,sim.time);}
     drawFrame(octx,out.width,out.height,sim,lookFor(sim));
     $('#clock').textContent=`${fmt(sim.time)}　地下${sim.floor}階`;
   }
@@ -760,7 +826,7 @@ async function exportMp4(){
       aenc.encode(ad);ad.close();apos+=n;
     }
   };
-  if(snd)snd.el.pause();
+  player.stop();
   exporting=true;cancelled=false;document.body.classList.add('lock');$('#go').disabled=true;$('#prog').classList.add('on');
   const xs=newSim(),dt=1/fps,t0=performance.now();
   const tick=()=>new Promise(r=>setTimeout(r,0));
@@ -793,7 +859,7 @@ async function exportMp4(){
     console.error(e);$('#progt').textContent='書き出しに失敗しました: '+(e.message||e);
     try{enc.close();}catch(_){}try{if(aenc)aenc.close();}catch(_){}if(stream)stream.abort().catch(()=>{});
   }finally{
-    exporting=false;document.body.classList.remove('lock');if(snd&&playing){snd.el.currentTime=sim.time%snd.buf.duration;snd.el.play().catch(()=>{});}$('#go').disabled=false;$('#cancel').style.display='none';
+    exporting=false;document.body.classList.remove('lock');if(snd&&playing)player.play(snd.buf,sim.time);$('#go').disabled=false;$('#cancel').style.display='none';
   }
 }
 
@@ -801,7 +867,7 @@ async function exportMp4(){
 try{view3d=new View3D();}catch(e){document.body.innerHTML='<p style="padding:24px">このブラウザでは3D表示が使えません。</p>';throw e;}
 buildThemes();renderUI();setupTabs();sizeCanvas();restart();
 $('#ver').textContent='v'+VERSION;
-$('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';if(snd){if(playing)snd.el.play().catch(()=>{});else snd.el.pause();}};
+$('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';if(snd){if(playing)player.play(snd.buf,sim.time);else player.stop();}};
 $('#afile').onchange=e=>{const f=e.target.files[0];if(f)loadAudio(f);e.target.value='';};
 $('#aclear').onclick=()=>clearAudio();
 addEventListener('dragover',e=>e.preventDefault());
