@@ -104,6 +104,9 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
           <h3>歌詞</h3><div class="seg" data-key="lyrics"></div>
           <div class="row" style="margin-top:6px"><label class="chip" style="display:inline-flex;align-items:center">歌詞のファイルを選ぶ<input type="file" id="lfile" accept=".lrc,.srt,.vtt,text/plain" hidden></label></div>
           <p class="note" id="linfo"></p>
+          <h3>終わり方</h3>
+          <label class="chip" style="display:inline-flex;align-items:center;gap:8px"><input type="checkbox" id="badend" style="width:18px;height:18px;margin:0;accent-color:#e8c55a">BAD END にする</label>
+          <p class="note">チェックを入れると、終わりの数秒前にパーティの前へドラゴンがあらわれ、曲が終わるところで炎を吐かれて全滅し、BAD END になります（長さを曲と違えたときは、書き出しの終わりに合わせます）。</p>
         </div>
         <h3>長さ</h3>
         <div class="seg" data-key="minutes"></div>
@@ -124,7 +127,7 @@ input[type=number]{width:110px;background:#1b1b20;border:1px solid var(--line);b
 <script src="mp4-muxer.js"></script>
 <script>
 'use strict';
-const VERSION = '1.4.1';
+const VERSION = '1.5.0';
 
 // ---------- 乱数・小道具 ----------
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
@@ -195,6 +198,11 @@ const MONS=[['あやしい ひとかげ','コボルド'],['ちいさな いき�
   ['ただよう もや','ガスクラウド'],['がいこつ','スケルトン'],['あやしい ひとかげ','オーク'],['むし','ジャイアントモス'],
   ['ローブを まとった ひと','まどうし'],['ころがる もの','クリーピングコイン'],['いぬ','ヘルハウンド']];
 const SPEEDS={slow:.75,mid:.48,fast:.3};
+// バッドエンド：lead 秒前に足を止めてドラゴンがあらわれ、終わりの end 秒前に炎を吐く。min 秒より短い書き出しでは起こさない
+const CRASH={lead:3.6,end:2.6,min:10,
+  msgs:[[-3.4,'なにかが ちかづいてくる…'],[-2.3,'ドラゴンが あらわれた！'],[-1.1,'ドラゴンは ほのおを はいた！'],[.95,'パーティは ぜんめつした']]};
+// 一人ずつ倒れる時刻（炎を吐いてからの秒）
+const deadAt=i=>.12+i*.13;
 
 class Sim{
   constructor(o){
@@ -207,7 +215,7 @@ class Sim{
     this.cam={x:.5,y:.5,a:this.ang};
     this.queue=[];this.cur=null;this.time=0;this.steps=0;this.floorSteps=0;
     this.stairsGoal=this.goal(); this.visited=new Set([key(0,0)]); this.seenStairs=new Set();
-    this.log=[]; this.fade=0; this.gold=0; this.cool=25;
+    this.log=[]; this.fade=0; this.gold=0; this.cool=25; this.endAt=o.endAt||0;
     this.banner={text:'地下 1 階',t0:0};
     const pool=[...NAMES];
     this.party=CLASSES.map(([c,a,b])=>{
@@ -221,8 +229,13 @@ class Sim{
   get slow(){return this.o.cfg.deco?1:.002;}
   goal(){return 90+((this.r()*160)|0);}
   say(text){this.log.push({text,t:this.time});if(this.log.length>8)this.log.shift();}
+  // 炎を吐かれる時刻（バッドエンドのとき。終わりの 2.6 秒前）。その lead 秒前から足を止める
+  get tImp(){return this.endAt>=CRASH.min?this.endAt-CRASH.end:Infinity;}
   update(dt){
+    const t0=this.time,ti=this.tImp;
     this.time+=dt;
+    for(const[k,t]of CRASH.msgs)if(t0<ti+k&&ti+k<=this.time)this.say(t);
+    if(this.time>=ti-CRASH.lead){this.fade=0;dt=Math.max(0,ti-CRASH.lead-t0);}
     for(let g=0;dt>1e-9&&g<64;g++){
       if(!this.cur)this.next();
       const a=this.cur, use=Math.min(a.dur-a.t,dt);
@@ -628,6 +641,43 @@ function lookFor(sim){
   return{theme,wire,line:LINES[cfg.line]||LINES.white,view:VIEWS[cfg.view]||6,crisp:cfg.pixel!=='full',
     ui:wire?(LINES[cfg.line]||LINES.white):[238,232,216],skin:SKINS[theme.id],acc:wire?(LINES[cfg.line]||LINES.white):SKINS[theme.id].acc};
 }
+// ドラゴン（正面向き）。k はあらわれ具合、mouth は口の開き。線画では黒く塗って線で縁どる
+function drawDragon(g,v,look,k,mouth,t){
+  const S=v.h*.5*(.55+.45*k),cx=v.x+v.w/2,cy=v.y+v.h*.55+Math.sin(t*2.2)*v.h*.008,wire=look.wire;
+  const P=pts=>{g.beginPath();pts.forEach(([x,y],i)=>i?g.lineTo(cx+x*S,cy+y*S):g.moveTo(cx+x*S,cy+y*S));g.closePath();};
+  const body=wire?'#000':g.createLinearGradient(0,cy-S,0,cy+S);
+  if(!wire){body.addColorStop(0,'rgb(150,40,36)');body.addColorStop(1,'rgb(60,14,18)');}
+  const edge=wire?rgb(look.line):'rgba(20,4,6,.9)',lw=Math.max(1,v.h/270)*(wire?1:1.4);
+  const shape=(pts,fill=body)=>{P(pts);g.fillStyle=fill;g.fill();g.strokeStyle=edge;g.lineWidth=lw;g.stroke();};
+  g.save();g.globalAlpha=k;g.lineJoin='round';
+  const flap=Math.sin(t*1.6)*.04;
+  for(const sd of[-1,1]){const W=[[-.25,-.1],[-1,-.78-flap],[-.86,-.38],[-1.06,-.22+flap],[-.8,.04],[-.96,.27],[-.3,.22]];shape(W.map(([x,y])=>[x*sd,y]),wire?'#000':'rgb(96,26,30)');
+    if(!wire){g.strokeStyle='rgba(30,6,8,.8)';g.beginPath();for(const[x,y]of W.slice(2,6)){g.moveTo(cx-.27*sd*S,cy-.08*S);g.lineTo(cx+x*sd*S,cy+y*S);}g.stroke();}}
+  g.beginPath();g.ellipse(cx,cy+.48*S,.38*S,.52*S,0,0,Math.PI*2);g.fillStyle=body;g.fill();g.strokeStyle=edge;g.lineWidth=lw;g.stroke();
+  if(!wire){g.fillStyle='rgba(220,170,110,.35)';g.beginPath();g.ellipse(cx,cy+.55*S,.18*S,.38*S,0,0,Math.PI*2);g.fill();}
+  shape([[-.16,.08],[.16,.08],[.12,-.3],[-.12,-.3]]);
+  for(const sd of[-1,1])shape([[-.2*sd,-.6],[-.42*sd,-.94],[-.1*sd,-.64]],wire?'#000':'rgb(210,196,170)');
+  const j=mouth*.13;
+  if(j>.005){g.fillStyle=`rgba(255,${150+mouth*90|0},60,${.9})`;g.beginPath();g.ellipse(cx,cy+(-.24+j/2)*S,.15*S,(j/2+.02)*S,0,0,Math.PI*2);g.fill();}
+  shape([[-.16,-.24+j],[.16,-.24+j],[.1,-.07+j],[-.1,-.07+j]]);
+  shape([[-.3,-.38],[-.2,-.62],[0,-.69],[.2,-.62],[.3,-.38],[.16,-.24],[-.16,-.24]]);
+  for(const sd of[-1,1]){g.fillStyle='rgb(255,226,80)';g.beginPath();g.ellipse(cx+.12*sd*S,cy-.45*S,.045*S,.025*S,-.35*sd,0,Math.PI*2);g.fill();
+    g.fillStyle='rgba(255,200,60,.25)';g.beginPath();g.arc(cx+.12*sd*S,cy-.45*S,.09*S,0,Math.PI*2);g.fill();}
+  g.restore();
+  return{x:cx,y:cy-.2*S,S};
+}
+// 吐かれた炎。f は強さ（0〜1）、grow は広がり具合
+function drawFire(g,v,o,f,grow,t){
+  if(f<=0)return;
+  g.save();g.beginPath();g.rect(v.x,v.y,v.w,v.h);g.clip();
+  const R=v.h*(.15+grow*1.6),gr=g.createRadialGradient(o.x,o.y,0,o.x,o.y,R);
+  gr.addColorStop(0,`rgba(255,250,210,${f})`);gr.addColorStop(.35,`rgba(255,180,60,${f})`);gr.addColorStop(.75,`rgba(230,70,20,${f*.85})`);gr.addColorStop(1,'rgba(120,10,0,0)');
+  g.fillStyle=gr;g.fillRect(v.x,v.y,v.w,v.h);
+  const r=mulberry32((t*24)|0);
+  for(let i=0;i<22;i++){const a=r()*6.283,d=R*(.3+r()*.7),rr=v.h*(.04+r()*.09)*(.5+grow);
+    g.fillStyle=`rgba(255,${120+r()*110|0},${30+r()*40|0},${f*(.35+r()*.4)})`;g.beginPath();g.arc(o.x+Math.cos(a)*d,o.y+Math.sin(a)*d*.8,rr,0,Math.PI*2);g.fill();}
+  g.restore();
+}
 let view3d;
 function drawFrame(g,W,H,sim,look){
   const fancy=cfg.deco&&!look.wire,L=layout(W,H,cfg.deco,fancy),s=H/480,v=L.view;
@@ -635,9 +685,36 @@ function drawFrame(g,W,H,sim,look){
   if(fancy)backdrop(g,W,H,L,look,s);
   const ph=PIXELS[cfg.pixel];let ih=ph?Math.min(v.h,ph):v.h;const iw=Math.max(2,Math.round(ih*v.w/v.h));ih=Math.round(ih);
   view3d.render(iw,ih,sim,look);
-  g.imageSmoothingEnabled=!ph;g.drawImage(view3d.cv,v.x,v.y,v.w,v.h);g.imageSmoothingEnabled=true;
+  const hit=sim.time-sim.tImp,FONT='"DotGothic16",monospace';
+  g.save();g.beginPath();g.rect(v.x,v.y,v.w,v.h);g.clip();
+  // 炎を浴びた瞬間に画面がゆれる
+  const sh=hit>0?v.h*.03*Math.exp(-hit*3):0,sx=sh*Math.sin(sim.time*97),sy=sh*Math.cos(sim.time*83),ab=Math.abs(sh);
+  g.imageSmoothingEnabled=!ph;g.drawImage(view3d.cv,v.x+sx-ab,v.y+sy-ab,v.w+ab*2,v.h+ab*2);g.imageSmoothingEnabled=true;
+  if(hit>-CRASH.lead){
+    // 暗がりからドラゴンが近づく
+    const k=smooth(clamp((hit+CRASH.lead)/1.3,0,1));
+    g.fillStyle=`rgba(0,0,0,${.35*k})`;g.fillRect(v.x,v.y,v.w,v.h);
+    const mouth=smooth(clamp((hit+1.1)/.8,0,1))*(1-smooth(clamp((hit-1)/.5,0,1)));
+    const o=drawDragon(g,{x:v.x+sx,y:v.y+sy,w:v.w,h:v.h},look,k,mouth,sim.time);
+    const f=smooth(clamp((hit+.25)/.3,0,1))*(1-smooth(clamp((hit-.8)/.5,0,1)));
+    drawFire(g,v,o,f,smooth(clamp((hit+.25)/.6,0,1)),sim.time);
+  }
+  g.restore();
   if(sim.fade>0){g.fillStyle=`rgba(0,0,0,${sim.fade})`;g.fillRect(v.x,v.y,v.w,v.h);}
-  const col=rgb(look.ui),FONT='"DotGothic16",monospace';
+  if(hit>0){
+    if(hit<.07){g.fillStyle='rgba(255,250,230,.9)';g.fillRect(v.x,v.y,v.w,v.h);}
+    g.fillStyle=`rgba(160,0,0,${.3*smooth(clamp((hit-.6)/.8,0,1))})`;g.fillRect(v.x,v.y,v.w,v.h);
+    const dark=smooth(clamp((hit-1.1)/.6,0,1));
+    if(dark>0){g.fillStyle=`rgba(0,0,0,${dark})`;g.fillRect(v.x,v.y,v.w,v.h);}
+    const ta=clamp((hit-1.5)/.4,0,1);
+    if(ta>0){
+      const fs=Math.round(v.h*.13);g.textAlign='center';g.textBaseline='middle';
+      g.font=`${fs}px ${FONT}`;g.fillStyle=`rgba(220,30,30,${ta})`;g.fillText('BAD END',v.x+v.w/2,v.y+v.h/2-fs*.3);
+      g.font=`${Math.round(fs*.32)}px ${FONT}`;g.fillStyle=rgb(look.ui,ta*.85);g.fillText('パーティは ぜんめつした',v.x+v.w/2,v.y+v.h/2+fs*.55);
+      g.textAlign='left';
+    }
+  }
+  const col=rgb(look.ui);
   // 階の表示
   const age=sim.time-sim.banner.t0,ba=clamp(Math.min(age/.35,(2.6-age)/.6),0,1);
   if(ba>0){
@@ -670,7 +747,8 @@ function drawFrame(g,W,H,sim,look){
     const row=(i,vals,a=1,c=look.ui)=>{const y=r.y+pad+rowH*i+(rowH-fs)/2;g.fillStyle=rgb(c,a);
       cols.forEach(([fx,,al],j)=>{g.textAlign=al==='r'?'right':'left';g.fillText(fitText(g,String(vals[j]),w*.4),x+w*fx,y);});g.textAlign='left';};
     row(0,cols.map(c=>c[1]),look.wire?.6:.9,look.acc);
-    sim.party.forEach((m,i)=>row(i+1,[m.name,m.cls,m.ac,m.hp,'OK'],m.hp<m.max*.3?.65:1));}
+    // 炎を浴びたら一人ずつ倒れる
+    sim.party.forEach((m,i)=>{const dead=hit>deadAt(i);row(i+1,[m.name,m.cls,m.ac,dead?0:m.hp,dead?'しぼう':'OK'],dead?.9:m.hp<m.max*.3?.65:1,dead?[230,70,60]:look.ui);});}
   // 地図
   {const r=L.map,W2=sim.world;
     g.fillStyle=rgb(look.acc);g.fillText(`地下 ${sim.floor} 階`,r.x+pad,r.y+pad);
@@ -727,7 +805,7 @@ const OPTS={
   lyrics:[[true,'出す'],[false,'出さない']],
 };
 const RESTART=new Set(['walk','speed']);
-const DEF={aspect:'4:3',res:'1440x1080',theme:'wire',line:'white',deco:true,pixel:'full',view:'mid',walk:'smooth',speed:'mid',seed:1+((Math.random()*999999)|0),minutes:5,fps:30,lyrics:true};
+const DEF={aspect:'4:3',res:'1440x1080',theme:'wire',line:'white',deco:true,pixel:'full',view:'mid',walk:'smooth',speed:'mid',seed:1+((Math.random()*999999)|0),minutes:5,fps:30,lyrics:true,badEnd:false};
 let cfg={...DEF};
 try{Object.assign(cfg,JSON.parse(localStorage.getItem('endless-dungeon')||'{}'));}catch(e){}
 if(!RES[cfg.aspect].some(r=>r[0]===cfg.res))cfg.res=RES[cfg.aspect].at(-1)[0];
@@ -735,12 +813,34 @@ const save=()=>{try{localStorage.setItem('endless-dungeon',JSON.stringify(cfg));
 
 const $=s=>document.querySelector(s), out=$('#out'), octx=out.getContext('2d');
 let sim, playing=true, exporting=false, cancelled=false;
-const newSim=()=>new Sim({seed:cfg.seed,speed:cfg.speed,walk:cfg.walk,cfg});
-function restart(){sim=newSim();if(snd&&playing)player.play(snd.buf,0);}
+// バッドエンドにする長さ（曲を入れてチェックしたときだけ。0 なら起こさない）
+const endAtFor=sec=>snd&&cfg.badEnd&&sec>=CRASH.min?sec:0;
+const newSim=()=>new Sim({seed:cfg.seed,speed:cfg.speed,walk:cfg.walk,cfg,endAt:endAtFor(cfg.minutes*60)});
+function restart(){sim=newSim();player.sfxStop();if(snd&&playing)player.play(snd.buf,0);}
 
 // ---------- 音 ----------
 let snd=null;
 const AINFO='入れると、その音付きで書き出します。長さは曲に合わせます。曲より長くすると頭から繰り返し、どちらの場合も最後の1.5秒で音を小さくして終えます。この画面に音のファイルを放り込んでも入ります。';
+// 全滅の音（足音→咆哮→炎）。lead 秒目が炎を浴びる瞬間
+const SFX_LEAD=3.4,sfxCache=new Map();
+function crashSfx(sr){
+  if(sfxCache.has(sr))return sfxCache.get(sr);
+  const n=Math.round(sr*(SFX_LEAD+2.4)),d=new Float32Array(n),r=mulberry32(707),I=Math.round(SFX_LEAD*sr);
+  // ずしん、ずしん（近づくほど大きく）
+  for(const[t0,a]of[[.1,.35],[.75,.5],[1.4,.7]]){const i0=Math.round(t0*sr);let lp=0;
+    for(let i=i0;i<Math.min(n,i0+sr*.5);i++){const t=(i-i0)/sr;lp+=((r()*2-1)-lp)*.05;d[i]+=a*(Math.sin(6.2832*(48*t-30*t*t))*Math.exp(-t*9)+lp*1.5*Math.exp(-t*14));}}
+  // 咆哮：うなる低い音とざらつき、高さが下がる
+  {const i0=Math.round(1.15*sr),L=Math.round(1.25*sr);let ph=0,lp=0;
+    for(let i=0;i<L&&i0+i<n;i++){const t=i/sr,f=(170-70*t)*(1+.03*Math.sin(t*38)),e=Math.min(1,t/.08)*Math.min(1,(1.25-t)/.4);
+      ph+=f/sr;lp+=((r()*2-1)-lp)*.3;const saw=2*(ph%1)-1;d[i0+i]+=e*(.2*Math.tanh(2*saw+Math.sin(6.2832*ph*1.5))+.14*lp);}}
+  // 炎：ふくらむ低めのノイズ、浴びた瞬間にどん
+  {let lp=0,lp2=0;
+    for(let i=I-Math.round(.35*sr);i<n;i++){const t=(i-I)/sr;lp+=((r()*2-1)-lp)*.12;lp2+=((r()*2-1)-lp2)*.5;
+      const e=t<0?Math.pow((t+.35)/.35,2):Math.exp(-Math.max(0,t-.5)*2.4);
+      d[i]+=e*(1.3*lp+.25*lp2*(.6+.4*Math.sin(t*53)))+(t>=0?.9*Math.sin(6.2832*(40*t))*Math.exp(-t*6):0);}}
+  for(let i=0;i<n;i++)d[i]=clamp(d[i],-1,1);
+  sfxCache.set(sr,d);return d;
+}
 // プレビュー用の再生（ブラウザが鳴らせない形式でも、解いた後の波形を直接鳴らす）
 const player={ctx:null,src:null,t0:0,
   unlock(){try{if(!this.ctx)this.ctx=new (window.AudioContext||window.webkitAudioContext)();this.ctx.resume();}catch(e){}},
@@ -751,6 +851,13 @@ const player={ctx:null,src:null,t0:0,
     this.src=s;this.t0=this.ctx.currentTime-off;
   },
   stop(){if(this.src){try{this.src.stop();}catch(e){}this.src.disconnect();this.src=null;}},
+  sfx(at){
+    this.unlock();if(!this.ctx)return;
+    const d=crashSfx(this.ctx.sampleRate),off=Math.max(0,at),b=this.ctx.createBuffer(1,d.length,this.ctx.sampleRate);
+    b.copyToChannel(d,0);const s=this.ctx.createBufferSource();s.buffer=b;s.connect(this.ctx.destination);
+    if(off<b.duration)s.start(0,off);this.fx=s;
+  },
+  sfxStop(){if(this.fx){try{this.fx.stop();}catch(e){}this.fx=null;}},
   pos(buf){return(this.ctx.currentTime-this.t0)%buf.duration;},
 };
 // MP4（.m4a）の中から Opus の音の粒を取り出す
@@ -904,7 +1011,7 @@ function renderUI(){
   for(const[v,label]of RES[cfg.aspect]){const b=document.createElement('button');b.className='chip'+(cfg.res===v?' on':'');b.textContent=label;
     b.onclick=()=>{cfg.res=v;save();renderUI();sizeCanvas();};re.appendChild(b);}
   document.querySelectorAll('.theme').forEach(b=>b.classList.toggle('on',b.dataset.id===cfg.theme));
-  $('#seed').value=cfg.seed;$('#mins').value=fmt(Math.round(cfg.minutes*60));
+  $('#seed').value=cfg.seed;$('#badend').checked=!!cfg.badEnd;$('#mins').value=fmt(Math.round(cfg.minutes*60));
 }
 function buildThemes(){
   const box=$('#themes');
@@ -936,8 +1043,14 @@ let last=performance.now();
 function loop(ts){
   const dt=Math.min(.25,(ts-last)/1000);last=ts;
   if(!exporting){
+    sim.endAt=endAtFor(cfg.minutes*60);
+    const pt=sim.time;
     if(playing)sim.update(dt);
-    if(snd&&playing&&player.src){const D=snd.buf.duration,g=Math.abs(player.pos(snd.buf)-sim.time%D);if(Math.min(g,D-g)>.3)player.play(snd.buf,sim.time);}
+    // バッドエンド：音を鳴らし、終わったら曲を止めて、少し置いて最初から
+    const fx=sim.tImp-SFX_LEAD;
+    if(playing&&pt<fx&&sim.time>=fx)player.sfx(sim.time-fx);
+    if(sim.endAt&&sim.time>=sim.endAt){player.stop();if(sim.time>=sim.endAt+2.5)restart();}
+    else if(snd&&playing&&player.src){const D=snd.buf.duration,g=Math.abs(player.pos(snd.buf)-sim.time%D);if(Math.min(g,D-g)>.3)player.play(snd.buf,sim.time);}
     drawFrame(octx,out.width,out.height,sim,lookFor(sim));
     $('#clock').textContent=`${fmt(sim.time)}　地下${sim.floor}階`;
   }
@@ -1005,7 +1118,9 @@ async function exportMp4(){
   let err=null;
   const enc=new VideoEncoder({output:(ch,meta)=>muxer.addVideoChunk(ch,meta),error:e=>{err=e;}});
   enc.configure(config);
-  let aenc=null,apos=0;const atotal=Math.round(total/fps*asr),FADE=1.5;
+  let aenc=null,apos=0;const atotal=Math.round(total/fps*asr),FADE=1.5,endAt=endAtFor(total/fps);
+  // バッドエンドの効果音（曲のフェードとは別に、上から重ねる）
+  const sfx=endAt?crashSfx(asr):null,sfx0=endAt?Math.round((endAt-CRASH.end-SFX_LEAD)*asr):0;
   if(aconf){aenc=new AudioEncoder({output:(ch,meta)=>muxer.addAudioChunk(ch,fixAacMeta(meta,aconf)),error:e=>{err=e;}});aenc.configure(aconf);}
   // 動画のコマに追いつくまで音を流し込む（曲が短ければ頭から繰り返し、最後はしぼる）
   const feed=until=>{
@@ -1013,14 +1128,14 @@ async function exportMp4(){
     const L=snd.buf.length,src=[...Array(ach)].map((_,c)=>snd.buf.getChannelData(Math.min(c,snd.buf.numberOfChannels-1)));
     while(apos<until){
       const n=Math.min(4096,until-apos),data=new Float32Array(n*ach);
-      for(let c=0;c<ach;c++)for(let k=0;k<n;k++){const s=apos+k,rem=(atotal-s)/asr;data[c*n+k]=src[c][s%L]*(rem<FADE?rem/FADE:1);}
+      for(let c=0;c<ach;c++)for(let k=0;k<n;k++){const s=apos+k,rem=(atotal-s)/asr;data[c*n+k]=clamp(src[c][s%L]*(rem<FADE?rem/FADE:1)+(sfx&&s>=sfx0&&s-sfx0<sfx.length?sfx[s-sfx0]:0),-1,1);}
       const ad=new AudioData({format:'f32-planar',sampleRate:asr,numberOfFrames:n,numberOfChannels:ach,timestamp:Math.round(apos/asr*1e6),data});
       aenc.encode(ad);ad.close();apos+=n;
     }
   };
   player.stop();
   exporting=true;cancelled=false;document.body.classList.add('lock');$('#go').disabled=true;$('#prog').classList.add('on');
-  const xs=newSim(),dt=1/fps,t0=performance.now();
+  const xs=newSim(),dt=1/fps,t0=performance.now();xs.endAt=endAt;
   const tick=()=>new Promise(r=>setTimeout(r,0));
   try{
     for(let i=0;i<total;i++){
@@ -1059,9 +1174,10 @@ async function exportMp4(){
 try{view3d=new View3D();}catch(e){document.body.innerHTML='<p style="padding:24px">このブラウザでは3D表示が使えません。</p>';throw e;}
 buildThemes();renderUI();setupTabs();sizeCanvas();restart();
 $('#ver').textContent='v'+VERSION;
-$('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';if(snd){if(playing)player.play(snd.buf,sim.time);else player.stop();}};
+$('#play').onclick=()=>{playing=!playing;$('#play').textContent=playing?'❚❚':'▶';player.sfxStop();if(snd){if(playing&&!(sim.endAt&&sim.time>=sim.endAt))player.play(snd.buf,sim.time);else player.stop();}};
 $('#afile').onchange=e=>{const f=e.target.files[0];if(f)loadAudio(f);e.target.value='';};
 $('#aclear').onclick=()=>clearAudio();
+$('#badend').onchange=e=>{cfg.badEnd=e.target.checked;save();};
 $('#lfile').onchange=e=>{const f=e.target.files[0];if(f)loadLyrics(f);e.target.value='';};
 addEventListener('dragover',e=>e.preventDefault());
 addEventListener('drop',e=>{e.preventDefault();
